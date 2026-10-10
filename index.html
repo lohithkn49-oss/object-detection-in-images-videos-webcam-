@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Object detector (in-browser)</title>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<style>
+  :root { --bg:#eef1f4; --panel:#fff; --ink:#1b2430; --muted:#5f6b7a; --line:#d3d9e0; --accent:#0b6e4f; --accent-ink:#fff; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#11161c; --panel:#1a212a; --ink:#e8edf2; --muted:#93a0ae; --line:#2c3642; --accent:#4cc38a; --accent-ink:#08140e; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  main { max-width:1100px; margin:0 auto; padding:24px 16px 48px; display:grid; gap:20px; grid-template-columns:1fr 280px; }
+  @media (max-width:800px) { main { grid-template-columns:1fr; } }
+  h1 { grid-column:1/-1; margin:0; font-size:1.5rem; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  .tabs { display:flex; gap:6px; margin-bottom:14px; }
+  .tabs button { flex:1; padding:8px; border:1px solid var(--line); background:transparent; color:var(--ink); border-radius:6px; font:inherit; cursor:pointer; }
+  .tabs button[aria-selected="true"] { background:var(--accent); color:var(--accent-ink); border-color:var(--accent); }
+  button:focus-visible, input:focus-visible { outline:3px solid var(--accent); outline-offset:2px; }
+  .stage { position:relative; background:#000; border-radius:6px; overflow:hidden; min-height:240px; display:grid; place-items:center; }
+  .stage video, .stage img { display:block; max-width:100%; max-height:70vh; }
+  .stage canvas { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+  .empty { color:#9aa5b1; padding:40px 16px; text-align:center; }
+  .controls { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-top:14px; }
+  .controls button, .file { padding:8px 14px; border-radius:6px; font:inherit; cursor:pointer; border:1px solid var(--accent); background:var(--accent); color:var(--accent-ink); }
+  .controls button.secondary { background:transparent; color:var(--ink); border-color:var(--line); }
+  input[type=file] { display:none; }
+  label.row { display:block; margin-bottom:14px; font-size:.9rem; color:var(--muted); }
+  input[type=range] { width:100%; }
+  .stat { display:flex; justify-content:space-between; padding:4px 0; border-bottom:1px solid var(--line); font-variant-numeric:tabular-nums; }
+  #list { margin:12px 0 0; padding:0; list-style:none; max-height:260px; overflow:auto; }
+  #list li { display:flex; justify-content:space-between; padding:3px 0; }
+  #status { margin-top:10px; font-size:.9rem; color:var(--muted); min-height:1.4em; }
+  #status.error { color:#c2410c; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Object detector</h1>
+
+  <section class="panel">
+    <div class="tabs" role="tablist">
+      <button role="tab" data-mode="webcam" aria-selected="true">Webcam</button>
+      <button role="tab" data-mode="video" aria-selected="false">Video file</button>
+      <button role="tab" data-mode="image" aria-selected="false">Image</button>
+    </div>
+    <div class="stage" id="stage">
+      <p class="empty" id="empty">Choose a source below to start detecting.</p>
+      <video id="video" playsinline muted hidden></video>
+      <img id="img" alt="Uploaded image" hidden>
+      <canvas id="overlay"></canvas>
+    </div>
+    <div class="controls" id="controls"></div>
+    <div id="status" role="status">Loading model…</div>
+  </section>
+
+  <aside class="panel">
+    <label class="row">Minimum confidence: <strong id="confVal">50%</strong>
+      <input type="range" id="conf" min="10" max="90" value="50">
+    </label>
+    <div class="stat"><span>Frames per second</span><strong id="fps">–</strong></div>
+    <div class="stat"><span>Model time</span><strong id="ms">–</strong></div>
+    <div class="stat"><span>Objects found</span><strong id="count">0</strong></div>
+    <ul id="list"></ul>
+  </aside>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const video = $("video"), img = $("img"), overlay = $("overlay"), ctx = overlay.getContext("2d");
+
+let model = null, mode = "webcam", running = false, stream = null, loopId = 0;
+let lastData = null, lastSource = null, recorder = null, recChunks = [], recRaf = 0, recBtn = null;
+
+// ---------- Model ----------
+(async () => {
+  try {
+    await tf.setBackend("webgl");               // GPU; falls back to CPU automatically if unavailable
+  } catch (e) { /* use default backend */ }
+  try {
+    model = await cocoSsd.load({ base: "lite_mobilenet_v2" });   // use "mobilenet_v2" for higher accuracy
+    setStatus("Model ready (backend: " + tf.getBackend() + "). Choose a source.");
+  } catch (e) {
+    setStatus("Could not load the model: " + e.message + ". Check your internet connection.", true);
+  }
+})();
+
+// ---------- UI ----------
+document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => setMode(b.dataset.mode));
+$("conf").oninput = e => $("confVal").textContent = e.target.value + "%";
+
+function setStatus(msg, isError = false) { $("status").textContent = msg; $("status").className = isError ? "error" : ""; }
+
+function setMode(m) {
+  stopAll(); mode = m;
+  document.querySelectorAll(".tabs button").forEach(b => b.setAttribute("aria-selected", b.dataset.mode === m));
+  const c = $("controls"); c.innerHTML = "";
+  if (m === "webcam") {
+    c.append(btn("Start webcam", startWebcam), btn("Stop", stopAll, true),
+             btn("Save snapshot", saveSnapshot, true), recBtn = btn("Record video", toggleRecord, true));
+  } else if (m === "video") {
+    c.append(fileBtn("Choose video", "video/*", loadVideo), btn("Pause / resume", togglePlay, true),
+             btn("Save snapshot", saveSnapshot, true), recBtn = btn("Record video", toggleRecord, true));
+  } else {
+    c.append(fileBtn("Choose image", "image/*", loadImage), btn("Download result", saveSnapshot, true));
+  }
+}
+function btn(text, fn, secondary) {
+  const b = document.createElement("button"); b.textContent = text; b.onclick = fn;
+  if (secondary) b.className = "secondary"; return b;
+}
+function fileBtn(text, accept, fn) {
+  const l = document.createElement("label"); l.className = "file"; l.textContent = text;
+  const i = document.createElement("input"); i.type = "file"; i.accept = accept;
+  i.onchange = () => i.files[0] && fn(i.files[0]); l.append(i); return l;
+}
+function show(el) { video.hidden = img.hidden = true; $("empty").hidden = true; el.hidden = false; }
+
+function stopAll() {
+  if (recorder) stopRecording();
+  running = false; loopId++; lastData = lastSource = null;
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  video.pause(); video.removeAttribute("src"); video.srcObject = null;
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+  $("fps").textContent = $("ms").textContent = "–"; $("count").textContent = 0; $("list").innerHTML = "";
+}
+
+// ---------- Sources ----------
+async function startWebcam() {
+  if (!model) return setStatus("Model is still loading.", true);
+  stopAll();
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } });
+  } catch (e) {
+    return setStatus("Could not open the webcam: " + e.message + ". Allow camera access and open the page via http://localhost:8000.", true);
+  }
+  video.srcObject = stream; show(video); await video.play();
+  setStatus("Detecting from webcam…"); runLoop(video);
+}
+
+function loadVideo(file) {
+  if (!model) return setStatus("Model is still loading.", true);
+  stopAll(); video.src = URL.createObjectURL(file); video.loop = true; show(video);
+  video.onloadeddata = () => { video.play(); setStatus("Detecting in " + file.name); runLoop(video); };
+}
+function togglePlay() { video.paused ? video.play() : video.pause(); }
+
+async function loadImage(file) {
+  if (!model) return setStatus("Model is still loading.", true);
+  stopAll(); img.src = URL.createObjectURL(file); show(img); await img.decode();
+  await detectOnce(img);
+  setStatus("Done. Move the confidence slider and choose the image again to re-run.");
+}
+
+// ---------- Detection ----------
+async function detectOnce(source) {
+  const t0 = performance.now();
+  const preds = await model.detect(source, 50, $("conf").value / 100);
+  const ms = performance.now() - t0;
+  const w = source.videoWidth || source.naturalWidth, h = source.videoHeight || source.naturalHeight;
+  const data = {
+    width: w, height: h, inference_ms: Math.round(ms),
+    detections: preds.map(p => ({ label: p.class, score: p.score,
+                                  box: [p.bbox[0], p.bbox[1], p.bbox[0] + p.bbox[2], p.bbox[1] + p.bbox[3]] }))
+  };
+  draw(data, source);
+  return data;
+}
+
+async function runLoop(source) {
+  running = true; const id = ++loopId; let frames = 0, t0 = performance.now();
+  while (running && id === loopId) {
+    if (source.paused || source.ended || source.readyState < 2) { await new Promise(r => setTimeout(r, 100)); continue; }
+    try {
+      const data = await detectOnce(source);
+      $("ms").textContent = data.inference_ms + " ms"; frames++;
+      const dt = (performance.now() - t0) / 1000;
+      if (dt >= 1) { $("fps").textContent = (frames / dt).toFixed(1); frames = 0; t0 = performance.now(); }
+    } catch (e) { running = false; setStatus("Detection error: " + e.message, true); }
+    await new Promise(r => requestAnimationFrame(r));
+  }
+}
+
+// ---------- Drawing ----------
+function colorFor(label) {
+  let h = 0; for (const ch of label) h = (h * 31 + ch.charCodeAt(0)) % 360;
+  return `hsl(${h} 85% 55%)`;
+}
+
+function drawBoxes(g, data, ox, oy, sx, sy, fs) {
+  g.lineWidth = Math.max(2, fs / 7); g.font = fs + "px system-ui, sans-serif"; g.textBaseline = "top";
+  const lh = fs + 6;
+  for (const d of data.detections) {
+    const [x1, y1, x2, y2] = d.box, c = colorFor(d.label);
+    const x = ox + x1 * sx, y = oy + y1 * sy, w = (x2 - x1) * sx, h = (y2 - y1) * sy;
+    g.strokeStyle = c; g.strokeRect(x, y, w, h);
+    const text = `${d.label} ${Math.round(d.score * 100)}%`, tw = g.measureText(text).width + 8, ty = Math.max(0, y - lh);
+    g.fillStyle = c; g.fillRect(x, ty, tw, lh);
+    g.fillStyle = "#000"; g.fillText(text, x + 4, ty + 3);
+  }
+}
+
+function draw(data, source) {
+  lastData = data; lastSource = source;
+  const r = source.getBoundingClientRect(), st = $("stage").getBoundingClientRect();
+  overlay.width = st.width; overlay.height = st.height;
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+  drawBoxes(ctx, data, r.left - st.left, r.top - st.top, r.width / data.width, r.height / data.height, 14);
+
+  const counts = {};
+  for (const d of data.detections) counts[d.label] = (counts[d.label] || 0) + 1;
+  $("count").textContent = data.detections.length;
+  $("list").innerHTML = Object.entries(counts).sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => `<li><span>${k}</span><strong>${v}</strong></li>`).join("");
+}
+
+// ---------- Downloads ----------
+function mediaSize(src) { return [src.videoWidth || src.naturalWidth, src.videoHeight || src.naturalHeight]; }
+
+function paintFrame(g, src, w, h) {
+  g.drawImage(src, 0, 0, w, h);
+  if (lastData) drawBoxes(g, lastData, 0, 0, w / lastData.width, h / lastData.height, Math.max(14, Math.round(w / 55)));
+}
+
+function save(blob, name) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
+function saveSnapshot() {
+  if (!lastSource || !lastData) return setStatus("Nothing to save yet. Start a source first.", true);
+  const [w, h] = mediaSize(lastSource), c = document.createElement("canvas");
+  c.width = w; c.height = h; paintFrame(c.getContext("2d"), lastSource, w, h);
+  c.toBlob(b => { save(b, "detection.png"); setStatus("Saved detection.png"); }, "image/png");
+}
+
+function toggleRecord() {
+  if (recorder) return stopRecording();
+  if (!lastSource) return setStatus("Start a source first, then record.", true);
+  if (!window.MediaRecorder) return setStatus("This browser can't record video. Try Chrome, Edge or Firefox.", true);
+  const [w, h] = mediaSize(lastSource), c = document.createElement("canvas"), g = c.getContext("2d");
+  c.width = w; c.height = h;
+  const mime = ["video/webm;codecs=vp9", "video/webm"].find(m => MediaRecorder.isTypeSupported(m));
+  recorder = new MediaRecorder(c.captureStream(30), mime ? { mimeType: mime } : {});
+  recChunks = [];
+  recorder.ondataavailable = e => e.data.size && recChunks.push(e.data);
+  recorder.onstop = () => {
+    cancelAnimationFrame(recRaf);
+    save(new Blob(recChunks, { type: "video/webm" }), "detection.webm");
+    recorder = null; if (recBtn) recBtn.textContent = "Record video";
+    setStatus("Saved detection.webm");
+  };
+  recorder.start();
+  const tick = () => { paintFrame(g, lastSource, w, h); recRaf = requestAnimationFrame(tick); };
+  tick();
+  recBtn.textContent = "Stop and download"; setStatus("Recording the annotated video…");
+}
+function stopRecording() { recorder && recorder.state !== "inactive" && recorder.stop(); }
+
+setMode("webcam");
+</script>
+</body>
+</html>
